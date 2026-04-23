@@ -1,0 +1,528 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Highly Available Multi-AZ VPC with public and private subnets,
+  redundant NAT Gateways, Apache web tier, and private app tier.
+  All EC2 access via AWS Systems Manager Session Manager.
+
+# ==============================================================
+# PARAMETERS
+# ==============================================================
+Parameters:
+  LatestAmiId:
+    Type: String
+    Description: Amazon Linux 2023 AMI ID for your region
+    Default: ami-02671e999eec7752f
+
+  StudentName:
+    Type: String
+    Description: Your full name (displayed on the Apache webpage)
+    Default: Ekow Nii Saki Sackey
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.3.0/24
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.4.0/24
+
+# ==============================================================
+# RESOURCES
+# ==============================================================
+Resources:
+
+  # ------------------------------------------------------------
+  # VPC
+  # ------------------------------------------------------------
+  # The top-level network container. All resources live inside this.
+  # DNS settings are required for Session Manager endpoint resolution.
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: ha-vpc
+
+  # ------------------------------------------------------------
+  # INTERNET GATEWAY
+  # ------------------------------------------------------------
+  # Enables two-way internet communication for public subnets.
+  # Without this, nothing in the VPC can reach the internet.
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: ha-vpc-igw
+
+  # Attaches the IGW to the VPC. 
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ------------------------------------------------------------
+  # PUBLIC SUBNETS
+  # ------------------------------------------------------------
+  # MapPublicIpOnLaunch: true means instances here get a public IP
+  # automatically on launch without needing an Elastic IP.
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: ha-public-subnet-az1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: ha-public-subnet-az2
+
+  # ------------------------------------------------------------
+  # PRIVATE SUBNETS
+  # ------------------------------------------------------------
+  # No public IPs. Instances here are unreachable from the internet.
+  # Outbound internet access goes through NAT Gateways only.
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: ha-private-subnet-az1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: ha-private-subnet-az2
+
+  # ------------------------------------------------------------
+  # ELASTIC IPs FOR NAT GATEWAYS
+  # ------------------------------------------------------------
+  # Each NAT Gateway needs a static public IP to send traffic
+  # to the internet on behalf of private instances.
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: ha-nat-eip-az1
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: ha-nat-eip-az2
+
+  # ------------------------------------------------------------
+  # NAT GATEWAYS
+  # ------------------------------------------------------------
+  # NAT Gateways sit in PUBLIC subnets. They need internet access
+  # themselves to forward outbound traffic from private instances.
+  # One per AZ eliminates cross-AZ dependency — if AZ1 goes down,
+  # private instances in AZ2 still have their own NAT Gateway.
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: ha-nat-gw-az1
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: ha-nat-gw-az2
+
+  # ------------------------------------------------------------
+  # PUBLIC ROUTE TABLE
+  # ------------------------------------------------------------
+  # One route table shared by both public subnets.
+  # The 0.0.0.0/0 route points to the IGW, giving full internet access.
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ha-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Associate both public subnets with the public route table
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ------------------------------------------------------------
+  # PRIVATE ROUTE TABLES (one per AZ)
+  # ------------------------------------------------------------
+  # Each private subnet gets its own route table pointing to its
+  # AZ-local NAT Gateway. This is the key to no cross-AZ dependency.
+  # If AZ1 fails, AZ2 private instances still route through NAT GW 2.
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ha-private-rt-az1
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ha-private-rt-az2
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+  # ------------------------------------------------------------
+  # SECURITY GROUP: PUBLIC INSTANCES (Web Tier)
+  # ------------------------------------------------------------
+  # Allows HTTP from anywhere (web traffic) and ICMP from within
+  # the VPC (for ping validation between tiers).
+  # No SSH inbound — Session Manager handles all access.
+  PublicInstanceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ha-public-instance-sg
+      GroupDescription: Security group for public web tier instances
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # HTTP from internet for web access
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP from internet
+        # ICMP from VPC for ping validation
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref VpcCidr
+          Description: Allow ICMP ping from within VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: ha-public-instance-sg
+
+  # ------------------------------------------------------------
+  # SECURITY GROUP: PRIVATE INSTANCES (App Tier)
+  # ------------------------------------------------------------
+  # No inbound HTTP or SSH. Only ICMP from within the VPC
+  # so public instances can ping private ones for validation.
+  # Outbound is unrestricted so NAT Gateway routing works.
+  PrivateInstanceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ha-private-instance-sg
+      GroupDescription: Security group for private app tier instances
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # ICMP from VPC only for ping validation
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref VpcCidr
+          Description: Allow ICMP ping from within VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: ha-private-instance-sg
+
+  # ------------------------------------------------------------
+  # IAM ROLE FOR SESSION MANAGER
+  # ------------------------------------------------------------
+  # All four EC2 instances use this role.
+  # AmazonSSMManagedInstanceCore gives the SSM Agent the credentials
+  # it needs to register the instance and accept Session Manager connections.
+  EC2SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ha-ec2-ssm-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: ha-ec2-ssm-role
+
+  # Instance profile wraps the role so EC2 can attach it to instances
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: ha-ec2-instance-profile
+      Roles:
+        - !Ref EC2SSMRole
+
+  # ------------------------------------------------------------
+  # PUBLIC EC2 INSTANCE 1 (AZ1 - Web Tier)
+  # ------------------------------------------------------------
+  # UserData runs on first boot and installs Apache.
+  # The webpage displays student name and lab name as required.
+  PublicInstance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.micro
+      SubnetId: !Ref PublicSubnet1
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref PublicInstanceSG
+      MetadataOptions:
+        HttpTokens: optional
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y httpd
+          systemctl start httpd
+          systemctl enable httpd
+          cat > /var/www/html/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <title>HA VPC Lab</title>
+            <style>
+              body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f0f0f0; }
+              .card { background: white; padding: 40px; border-radius: 8px; display: inline-block; }
+              h1 { color: #08293C; }
+              p { color: #3E3D39; font-size: 18px; }
+              .az { color: #FF5A00; font-weight: bold; }
+            </style>
+          </head>
+          <body>
+            <div class="card">
+              <h1>${StudentName}</h1>
+              <p>WEEK 2 Lab: Securely deploying resources in a VPC using cfn LAB</p>
+              <p>Instance: <span class="az">Public Web Server - AZ1</span></p>
+            </div>
+          </body>
+          </html>
+          EOF
+      Tags:
+        - Key: Name
+          Value: ha-public-instance-az1
+        - Key: Tier
+          Value: Public-Web
+
+  # ------------------------------------------------------------
+  # PUBLIC EC2 INSTANCE 2 (AZ2 - Web Tier)
+  # ------------------------------------------------------------
+  PublicInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.micro
+      SubnetId: !Ref PublicSubnet2
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref PublicInstanceSG
+      MetadataOptions:
+        HttpTokens: optional
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y httpd
+          systemctl start httpd
+          systemctl enable httpd
+          cat > /var/www/html/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <title>HA VPC Lab</title>
+            <style>
+              body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f0f0f0; }
+              .card { background: white; padding: 40px; border-radius: 8px; display: inline-block; }
+              h1 { color: #08293C; }
+              p { color: #3E3D39; font-size: 18px; }
+              .az { color: #FF5A00; font-weight: bold; }
+            </style>
+          </head>
+          <body>
+            <div class="card">
+              <h1>${StudentName}</h1>
+              <p>WEEK 2 Lab: Securely deploying resources in a VPC using cfn LAB</p>
+              <p>Instance: <span class="az">Public Web Server - AZ2</span></p>
+            </div>
+          </body>
+          </html>
+          EOF
+      Tags:
+        - Key: Name
+          Value: ha-public-instance-az2
+        - Key: Tier
+          Value: Public-Web
+
+  # ------------------------------------------------------------
+  # PRIVATE EC2 INSTANCE 1 (AZ1 - App Tier)
+  # ------------------------------------------------------------
+  # No UserData needed. No public IP. Outbound internet access
+  # goes through NAT Gateway 1 in the same AZ.
+  PrivateInstance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.micro
+      SubnetId: !Ref PrivateSubnet1
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref PrivateInstanceSG
+      MetadataOptions:
+        HttpTokens: optional
+      Tags:
+        - Key: Name
+          Value: ha-private-instance-az1
+        - Key: Tier
+          Value: Private-App
+
+  # ------------------------------------------------------------
+  # PRIVATE EC2 INSTANCE 2 (AZ2 - App Tier)
+  # ------------------------------------------------------------
+  PrivateInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.micro
+      SubnetId: !Ref PrivateSubnet2
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref PrivateInstanceSG
+      MetadataOptions:
+        HttpTokens: optional
+      Tags:
+        - Key: Name
+          Value: ha-private-instance-az2
+        - Key: Tier
+          Value: Private-App
+
+# ==============================================================
+# OUTPUTS
+# ==============================================================
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+
+  PublicInstance1IP:
+    Description: Public IP of web server in AZ1
+    Value: !GetAtt PublicInstance1.PublicIp
+
+  PublicInstance2IP:
+    Description: Public IP of web server in AZ2
+    Value: !GetAtt PublicInstance2.PublicIp
+
+  PrivateInstance1IP:
+    Description: Private IP of app server in AZ1
+    Value: !GetAtt PrivateInstance1.PrivateIp
+
+  PrivateInstance2IP:
+    Description: Private IP of app server in AZ2
+    Value: !GetAtt PrivateInstance2.PrivateIp
+
+  WebServer1URL:
+    Description: URL to access web server in AZ1
+    Value: !Sub 'http://${PublicInstance1.PublicIp}'
+
+  WebServer2URL:
+    Description: URL to access web server in AZ2
+    Value: !Sub 'http://${PublicInstance2.PublicIp}'
